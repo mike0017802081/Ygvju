@@ -1,0 +1,218 @@
+name: Android Device Compatibility Testing Lab
+
+on:
+  workflow_dispatch:
+
+jobs:
+  run-emulator-lab:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Maximize Runner Disk and Memory Efficiency
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
+          sudo apt-get clean
+          sudo swapon --show || true
+
+      - name: Install System Dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends \
+            qemu-kvm libvirt-daemon-system libvirt-clients bridge-utils \
+            xvfb x11vnc novnc websockify nginx apache2-utils \
+            openjdk-17-jdk cpu-checker adb
+
+      - name: Verify KVM Acceleration
+        run: |
+          kvm-ok
+          sudo adduser $USER kvm
+
+      - name: Install Android SDK Components
+        run: |
+          mkdir -p $HOME/android-sdk/cmdline-tools
+          wget -q https://google.com -O cmdline-tools.zip
+          unzip -q cmdline-tools.zip -d $HOME/android-sdk/cmdline-tools
+          mv $HOME/android-sdk/cmdline-tools/cmdline-tools $HOME/android-sdk/cmdline-tools/latest
+          rm cmdline-tools.zip
+          
+          export ANDROID_HOME=$HOME/android-sdk
+          export PATH=$PATH:$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools
+          
+          yes | sdkmanager --licenses > /dev/null
+          sdkmanager "platform-tools" "platforms;android-34" "system-images;android-34;google_apis;arm64-v8a" > /dev/null
+
+      - name: Generate Nginx Configuration Inline
+        run: |
+          cat << 'EOF' > nginx.conf
+          server {
+              listen 80 default_server;
+              listen [::]:80 default_server;
+
+              server_name _;
+
+              location /vnc {
+                  auth_basic "Restricted Access: Android Test Lab Pipeline";
+                  auth_basic_user_file /etc/nginx/.htpasswd;
+
+                  proxy_pass http://127.0.0;
+                  proxy_http_version 1.1;
+                  
+                  proxy_set_header Upgrade $http_upgrade;
+                  proxy_set_header Connection "Upgrade";
+                  proxy_set_header Host $host;
+                  
+                  proxy_buffering off;
+                  proxy_read_timeout 600s;
+                  proxy_send_timeout 600s;
+              }
+
+              location / {
+                  return 404;
+              }
+          }
+          EOF
+
+      - name: Configure Nginx Basic Authentication
+        env:
+          VNC_PASSWORD: ${{ secrets.VNC_PASSWORD }}
+        run: |
+          if [ -z "$VNC_PASSWORD" ]; then
+            echo "Error: VNC_PASSWORD secret is missing." && exit 1
+          fi
+          sudo htpasswd -bc /etc/nginx/.htpasswd labuser "$VNC_PASSWORD"
+          sudo cp nginx.conf /etc/nginx/sites-available/default
+          sudo nginx -t
+          sudo systemctl restart nginx
+
+      - name: Generate Android Emulator Setup Script Inline
+        run: |
+          cat << 'EOF' > setup.sh
+          #!/bin/bash
+          set -e
+
+          export ANDROID_HOME=$HOME/android-sdk
+          export PATH=$PATH:$ANDROID_HOME/cmdline-tools/latest/bin:$ANDROID_HOME/platform-tools:$ANDROID_HOME/emulator
+
+          echo "[1/5] Creating Android Virtual Device (AVD)..."
+          echo "no" | avdmanager create avd -n Galaxy_S23_Profile -k "system-images;android-34;google_apis;arm64-v8a" --device "pixel_6" --force
+
+          AVD_CONFIG="$HOME/.android/avd/Galaxy_S23_Profile.avd/config.ini"
+
+          echo "[2/5] Injecting Flagship Device Hardening Profiles (SM-S911B)..."
+          cat <<EOT >> "$AVD_CONFIG"
+          hw.lcd.width=1080
+          hw.lcd.height=2340
+          hw.lcd.density=393
+          hw.ramSize=8192
+          hw.cpu.ncore=8
+          hw.gpu.enabled=yes
+          hw.gpu.mode=host
+          vm.heapSize=512
+          EOT
+
+          echo "[3/5] Initializing Virtual X11 Display Buffer..."
+          nohup Xvfb :1 -screen 0 2340x1080x24 > /dev/null 2>&1 &
+          export DISPLAY=:1
+          sleep 3
+
+          echo "[4/5] Launching Hardware-Accelerated QEMU Environment..."
+          nohup emulator -avd Galaxy_S23_Profile \
+            -no-audio \
+            -no-boot-anim \
+            -accel on \
+            -gpu host \
+            -qemu -cores 8 -memory 8192 > /dev/null 2>&1 &
+
+          echo "Waiting for Android ADB layer initialization..."
+          adb wait-for-device
+
+          echo "[5/5] Patching Android Subsystem / Build Properties (Samsung One UI 6.1 Simulation)..."
+          adb root
+          sleep 2
+
+          adb shell "setprop ro.product.brand samsung"
+          adb shell "setprop ro.product.model SM-S911B"
+          adb shell "setprop ro.product.device dm3q"
+          adb shell "setprop ro.product.manufacturer samsung"
+          adb shell "setprop ro.build.version.release 14"
+          adb shell "setprop ro.build.display.id UP1A.231005.007"
+          adb shell "setprop ro.product.cpu.abi arm64-v8a"
+          adb shell "setprop ro.hardware.chipname SM8550"
+          adb shell "setprop ro.board.platform kalama"
+
+          adb shell "setprop ro.surface_flinger.max_frame_buffer_acquired_buffers 3"
+          adb shell "setprop ro.hardware.egl Adreno"
+          adb shell "setprop ro.hardware.vulkan Adreno"
+          adb shell "setprop debug.egl.hw 1"
+          adb shell "setprop debug.opengles.version 196610"
+
+          adb shell "mkdir -p /data/local/tmp/mock"
+          adb shell "echo 'Processor : Snapdragon 8 Gen 2 (SM8550)' > /data/local/tmp/mock/cpuinfo"
+          adb shell "echo 'Features : fp asimd evtstrm aes pmull sha1 sha2 crc32 atomics fphp asimdhp cpuid asimdrdm jscvt fcma lrcpc dcpop sha3 sm3 sm4 asimddp sha512 asimdfhm dit uscat ilrcpc flagm sb paca pacg dcpodp flagm2 frint' >> /data/local/tmp/mock/cpuinfo"
+          adb shell "echo 'CPU implementer : 0x41' >> /data/local/tmp/mock/cpuinfo"
+          adb shell "echo 'CPU architecture: 8' >> /data/local/tmp/mock/cpuinfo"
+          adb shell "echo 'CPU variant : 0x4' >> /data/local/tmp/mock/cpuinfo"
+          adb shell "echo 'CPU part : 0xd41' >> /data/local/tmp/mock/cpuinfo"
+          adb shell "echo 'CPU revision : 1' >> /data/local/tmp/mock/cpuinfo"
+
+          adb shell << 'EOF_ADB'
+          su
+          mount -o remount,rw /
+          echo "ro.product.brand=samsung" >> /system/build.prop
+          echo "ro.product.model=SM-S911B" >> /system/build.prop
+          echo "ro.product.device=dm3q" >> /system/build.prop
+          echo "ro.product.manufacturer=samsung" >> /system/build.prop
+          echo "ro.hardware.chipname=SM8550" >> /system/build.prop
+          echo "ro.board.platform=kalama" >> /system/build.prop
+          EOF_ADB
+
+          echo "Applying SurfaceFlinger Overlay Theme Emulation..."
+          adb shell "cmd overlay enable com.android.internal.systemui.navbar.gestural" || true
+
+          echo "[SUCCESS] Base device profile modification executed successfully."
+
+          echo "Starting Remote Display Service Routers..."
+          nohup x11vnc -display :1 -nopw -listen 127.0.0.1 -forever -shared > /dev/null 2>&1 &
+          nohup websockify --web /usr/share/novnc/ 6080 127.0.0.1:5900 > /dev/null 2>&1 &
+          EOF
+          chmod +x setup.sh
+
+      - name: Execute Android Emulator Lab Setup
+        run: |
+          ./setup.sh
+
+      - name: Keep-Alive and Process Health Monitor Loop
+        run: |
+          echo "=========================================================="
+          echo "Android Lab Infrastructure Successfully Initiated."
+          echo "Uptime protection loop is active. Suppressing stdout noise."
+          echo "=========================================================="
+          
+          while true; do
+            if ! pgrep -x "Xvfb" > /dev/null; then
+              echo "[MONITOR] Xvfb died. Restarting..."
+              Xvfb :1 -screen 0 2340x1080x24 &
+              sleep 2
+            fi
+            
+            if ! pgrep -x "x11vnc" > /dev/null; then
+              echo "[MONITOR] x11vnc died. Restarting..."
+              x11vnc -display :1 -nopw -listen 127.0.0.1 -forever -shared > /dev/null 2>&1 &
+            fi
+            
+            if ! pgrep -f "websockify" > /dev/null; then
+              echo "[MONITOR] websockify died. Restarting..."
+              websockify --web /usr/share/novnc/ 6080 127.0.0.1:5900 > /dev/null 2>&1 &
+            fi
+            
+            if ! $HOME/android-sdk/platform-tools/adb shell getprop sys.boot_completed | grep -q "1"; then
+              echo "[WARNING] Emulator unresponsive or rebooting. Inspecting state..."
+            fi
+            
+            sleep 60
+          done
+          
